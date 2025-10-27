@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# OS/Editor
+.DS_Store
+
+# Outputs & large artifacts
+output/
+result.mp4
+*.avi
+*.mov
+*.log
+runs/
+
+# Weights / models
+yolo-weights/
+*.pt
+*.onnx
+*.xml
+*.bin
