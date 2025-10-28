@@ -22,7 +22,7 @@ except Exception:
 # Model/paths
 MODEL_PATH = "yolov8n.pt"     # start with 'n' for speed; switch to yolov8l.pt later
 VIDEO_PATH = "assets/traffic_cam.mp4"
-MASK_PATH  = "assets/mask.png"             # optional; set to None to disable
+MASK_PATH  = None ##"assets/mask.png"             # optional; set to None to disable
 
 # Classes we want to count (vehicles + people)
 ALLOWED_CLASS_NAMES = {"person", "car", "truck", "bus", "motorcycle"}
