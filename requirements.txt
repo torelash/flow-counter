@@ -3,3 +3,4 @@ opencv-python==4.9.0.80
 cvzone==1.6.1
 numpy==1.26.4
 filterpy==1.4.5
+scipy>=1.10
