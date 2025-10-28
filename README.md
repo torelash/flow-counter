@@ -1,7 +1,5 @@
 # Flow Counter — YOLOv8 + SORT (Vehicles & People)
 
-# Flow Counter — YOLOv8 + SORT (Vehicles & People)
-
 Effortlessly count **cars and people** in videos using a YOLOv8-powered detector plus SORT tracking. Designed for traffic and pedestrian flow monitoring, with clean counting lines, optional ROI masks, and a saved, fully annotated result video.
 
 ---
