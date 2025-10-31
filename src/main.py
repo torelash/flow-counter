@@ -5,12 +5,13 @@
 # Detects vehicles + people, tracks with SORT, counts line crossings (robust side-change),
 # overlays graphics, and saves result.mp4. Colab-safe and GPU/CPU-friendly.
 # ===============================================================
+# Flow Counter — YOLOv8 + SORT (People & Vehicles) | Lane-scoped gates
+# ===============================================================
 from ultralytics import YOLO
 import cv2 as cv
 import cvzone
 import numpy as np
-import math
-from pathlib import Path
+import math, os, subprocess
 
 # --- Tracking ---------------------------------------------------
 try:
@@ -18,34 +19,24 @@ try:
 except Exception:
     from sort import Sort
 
+# ===============================================================
+# Config (tuned for better distant/blurred car recall)
+# ===============================================================
+MODEL_PATH = "yolov8s.pt"
+VIDEO_PATH = "assets/traffic_cam.mp4"
+MASK_PATH  = None
 
-# ===============================================================
-# Config
-# ===============================================================
-MODEL_PATH = "yolov8n.pt"                 # auto-download lightweight YOLOv8n
-VIDEO_PATH = "assets/traffic_cam.mp4"     # input video
-MASK_PATH  = None                         # no mask by default
 ALLOWED_CLASS_NAMES = {"person", "car", "truck", "bus", "motorcycle"}
 
-# detection thresholds
-CONF_MIN = 0.35
-IOU_NMS  = 0.50
+CONF_MIN = 0.25
+IOU_NMS  = 0.45
 
-# SORT tracking
-SORT_MAX_AGE  = 22
-SORT_MIN_HITS = 3
-SORT_IOU_THR  = 0.30
+SORT_MAX_AGE  = 30
+SORT_MIN_HITS = 1
+SORT_IOU_THR  = 0.25
 
-# auto-calibration
-AUTO_CALIBRATE   = True
-WARMUP_FRAMES    = 200
-QUANTILES        = (0.35, 0.65)
-MIN_FLOW_PIX_PER_FRAME = 0.5
-
-# manual fallback lines
-line_up   = [180, 410, 640, 410]
-line_down = [680, 400, 1280, 450]
-
+# Re-encode to standard MP4 at the end (fixes Colab/browser playback)
+STANDARDIZE_MP4 = True
 
 # ===============================================================
 # Model & video setup
@@ -73,107 +64,32 @@ video_writer = cv.VideoWriter(
 tracker = Sort(max_age=SORT_MAX_AGE, min_hits=SORT_MIN_HITS, iou_threshold=SORT_IOU_THR)
 count_up, count_down, total_count = [], [], []
 
-
 # ===============================================================
-# Auto-calibration helper
+# Lane-scoped horizontal lines (left = UP, right = DOWN)
+# Tweaked fractions so:
+#  - UP line is strictly within left lanes
+#  - DOWN line starts further left (covers more of right lanes)
+# If still off, nudge LEFT_X2_FRAC (smaller = shorter UP), RIGHT_X1_FRAC (smaller = longer DOWN).
 # ===============================================================
-def _unit(v):
-    n = np.linalg.norm(v)
-    return (v / (n + 1e-9)).astype(np.float32), n
+LEFT_X1_FRAC  = 0.00
+LEFT_X2_FRAC  = 0.29    # was 0.48 → shorten UP so it doesn't reach right lanes
+RIGHT_X1_FRAC = 0.32    # was 0.52 → extend DOWN leftward into the divide/right lanes
+RIGHT_X2_FRAC = 1.00
 
-def _endpoints_from_center_and_dir(center_xy, dir_xy, span):
-    a = (center_xy - dir_xy * span).astype(int)
-    b = (center_xy + dir_xy * span).astype(int)
-    return [int(a[0]), int(a[1]), int(b[0]), int(b[1])]
+Y_UP_FRAC     = 0.38
+Y_DOWN_FRAC   = 0.62
 
-def autocalibrate_gates(model, vid, tracker, warmup_frames, conf_min, iou_nms, width, height):
-    warm_tracker = Sort(max_age=SORT_MAX_AGE, min_hits=max(1, SORT_MIN_HITS-1), iou_threshold=SORT_IOU_THR)
-    last_xy, flow_vecs, centroids = {}, [], []
+LEFT_X1   = int(width  * LEFT_X1_FRAC)
+LEFT_X2   = int(width  * LEFT_X2_FRAC)
+RIGHT_X1  = int(width  * RIGHT_X1_FRAC)
+RIGHT_X2  = int(width  * RIGHT_X2_FRAC)
+Y_UP      = int(height * Y_UP_FRAC)
+Y_DOWN    = int(height * Y_DOWN_FRAC)
 
-    try:
-        vid.set(cv.CAP_PROP_POS_FRAMES, 0)
-    except:
-        pass
+line_up   = [LEFT_X1,  Y_UP,   LEFT_X2,  Y_UP]
+line_down = [RIGHT_X1, Y_DOWN, RIGHT_X2, Y_DOWN]
 
-    frames_seen = 0
-    while frames_seen < warmup_frames:
-        ok, frame = vid.read()
-        if not ok or frame is None:
-            break
-        frames_seen += 1
-
-        results = model(frame, conf=conf_min, iou=iou_nms, verbose=False)
-        dets = np.empty((0, 5), dtype=np.float32)
-        if results and len(results) > 0:
-            r = results[0]
-            for box in r.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                conf = float(box.conf[0])
-                cls  = int(box.cls[0])
-                if cls in ALLOWED_CLASS_IDS and conf >= conf_min:
-                    dets = np.vstack([dets, [x1, y1, x2, y2, conf]])
-
-        tracks = warm_tracker.update(dets)
-        for tr in tracks:
-            x1, y1, x2, y2, tid = map(int, tr)
-            cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
-            centroids.append([cx, cy])
-            if tid in last_xy:
-                dx, dy = cx - last_xy[tid][0], cy - last_xy[tid][1]
-                if dx*dx + dy*dy > 1.0:
-                    flow_vecs.append([dx, dy])
-            last_xy[tid] = (cx, cy)
-
-    # rewind
-    try:
-        vid.set(cv.CAP_PROP_POS_FRAMES, 0)
-    except:
-        path = VIDEO_PATH
-        vid.release()
-        new_vid = cv.VideoCapture(path)
-        globals()['vid'] = new_vid
-
-    if len(flow_vecs) < 10 or len(centroids) < 50:
-        print("[AUTO] Not enough motion; keeping manual lines.")
-        return None, None
-
-    flow = np.median(np.array(flow_vecs, dtype=np.float32), axis=0)
-    d, flow_mag = _unit(flow)
-    if flow_mag < MIN_FLOW_PIX_PER_FRAME:
-        print(f"[AUTO] Flow too small ({flow_mag:.2f}); keeping manual lines.")
-        return None, None
-
-    g = np.array([-d[1], d[0]], dtype=np.float32)
-    pts = np.array(centroids, dtype=np.float32)
-    proj = pts @ d
-    q_low, q_high = np.quantile(proj, QUANTILES)
-
-    c1 = d * q_low
-    c2 = d * q_high
-    span = max(width, height) * 1.5
-    L1 = _endpoints_from_center_and_dir(c1, g, span)
-    L2 = _endpoints_from_center_and_dir(c2, g, span)
-
-    y1 = (L1[1] + L1[3]) / 2.0
-    y2 = (L2[1] + L2[3]) / 2.0
-    line_hi, line_lo = (L1, L2) if y1 < y2 else (L2, L1)
-
-    print(f"[AUTO] Flow ~ {flow} (|v|={flow_mag:.2f}); placed gates.")
-    return line_hi, line_lo
-
-
-# ===============================================================
-# Optional auto-calibration call
-# ===============================================================
-if AUTO_CALIBRATE:
-    hi, lo = autocalibrate_gates(model, vid, tracker, WARMUP_FRAMES, CONF_MIN, IOU_NMS, width, height)
-    if hi is not None and lo is not None:
-        line_up, line_down = hi, lo
-        print(f"[AUTO] line_up   = {line_up}")
-        print(f"[AUTO] line_down = {line_down}")
-    else:
-        print("[AUTO] Using manual lines.")
-
+LINE_BAND = 12  # ± pixels around line Y used to count (tolerates jitter)
 
 # ===============================================================
 # Main loop
@@ -184,52 +100,54 @@ while True:
         break
 
     frame_region = frame if mask is None else cv.bitwise_and(frame, mask)
-    results = model(frame_region, conf=CONF_MIN, iou=IOU_NMS, stream=True)
+    results = model(frame_region, conf=CONF_MIN, iou=IOU_NMS, imgsz=960, stream=True, verbose=False)
 
-    detections = np.empty((0, 5))
+    detections = np.empty((0, 5), dtype=np.float32)
     for r in results:
         for box in r.boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            conf = math.floor(box.conf[0]*100)/100
-            cls = int(box.cls[0])
-            if cls in ALLOWED_CLASS_IDS:
-                detections = np.vstack((detections, np.array([x1, y1, x2, y2, conf])))
+            conf = float(box.conf[0])
+            cls  = int(box.cls[0])
+            if cls in ALLOWED_CLASS_IDS and conf >= CONF_MIN:
+                detections = np.vstack((detections, np.array([x1, y1, x2, y2, conf], dtype=np.float32)))
 
     tracker_updates = tracker.update(detections)
 
-    # draw counting lines
+    # Draw gates + small labels on the segments
     cv.line(frame, (line_up[0], line_up[1]), (line_up[2], line_up[3]), (0, 0, 255), 3)
     cv.line(frame, (line_down[0], line_down[1]), (line_down[2], line_down[3]), (0, 0, 255), 3)
+    cv.putText(frame, "UP line",   (line_up[0] + 10,   line_up[1] - 12),   cv.FONT_HERSHEY_PLAIN, 2, (80,255,80), 3)
+    cv.putText(frame, "DOWN line", (line_down[0] + 10, line_down[1] - 12), cv.FONT_HERSHEY_PLAIN, 2, (255,150,50), 3)
 
-    # iterate through tracked objects
     for update in tracker_updates:
         x1, y1, x2, y2, tid = map(int, update)
         w, h = x2 - x1, y2 - y1
         cx, cy = (x1 + w//2), (y1 + h//2)
-        cv.circle(frame, (cx, cy), 5, (255, 0, 255), cv.FILLED)
 
-        # up-line
-        if line_up[0] < cx < line_up[2] and line_up[1] - 5 < cy < line_up[3] + 5:
+        cv.circle(frame, (cx, cy), 5, (255, 0, 255), cv.FILLED)
+        cvzone.cornerRect(frame, (x1, y1, w, h), l=5, colorR=(255, 0, 255), rt=1)
+        cvzone.putTextRect(frame, f'{tid}', (x1, y1), scale=1, thickness=2)
+
+        # UP (left lanes)
+        if (line_up[0] <= cx <= line_up[2]) and (line_up[1] - LINE_BAND <= cy <= line_up[3] + LINE_BAND):
             if tid not in total_count:
                 total_count.append(tid)
                 if tid not in count_up:
                     count_up.append(tid)
-        # down-line
-        if line_down[0] < cx < line_down[2] and line_down[1] - 5 < cy < line_down[3] + 5:
+            cv.line(frame, (line_up[0], line_up[1]), (line_up[2], line_up[3]), (0, 255, 0), 3)
+
+        # DOWN (right lanes)
+        if (line_down[0] <= cx <= line_down[2]) and (line_down[1] - LINE_BAND <= cy <= line_down[3] + LINE_BAND):
             if tid not in total_count:
                 total_count.append(tid)
                 if tid not in count_down:
                     count_down.append(tid)
+            cv.line(frame, (line_down[0], line_down[1]), (line_down[2], line_down[3]), (0, 255, 0), 3)
 
-        cvzone.cornerRect(frame, (x1, y1, w, h), l=5, colorR=(255, 0, 255), rt=1)
-        cvzone.putTextRect(frame, f'{tid}', (x1, y1), scale=1, thickness=2)
-
-    # --- draw counts and labels --------------------------------------------
+    # Counters + labels
     cv.putText(frame, str(len(total_count)), (255, 100), cv.FONT_HERSHEY_PLAIN, 5, (200, 50, 200), 7)
-    cv.putText(frame, str(len(count_up)),    (600,  85), cv.FONT_HERSHEY_PLAIN, 5, (200, 50, 200), 7)
-    cv.putText(frame, str(len(count_down)),  (850,  85), cv.FONT_HERSHEY_PLAIN, 5, (200, 50, 200), 7)
-
-    # new clear text labels
+    cv.putText(frame, str(len(count_up)),    (600,  85),  cv.FONT_HERSHEY_PLAIN, 5, (200, 50, 200), 7)
+    cv.putText(frame, str(len(count_down)),  (850,  85),  cv.FONT_HERSHEY_PLAIN, 5, (200, 50, 200), 7)
     cv.putText(frame, "TOTAL", (150, 60), cv.FONT_HERSHEY_PLAIN, 3, (255, 255, 255), 6)
     cv.putText(frame, "UP",    (560, 55),  cv.FONT_HERSHEY_PLAIN, 3, (80, 255, 80), 6)
     cv.putText(frame, "DOWN",  (820, 55),  cv.FONT_HERSHEY_PLAIN, 3, (255, 150, 50), 6)
@@ -237,9 +155,20 @@ while True:
     video_writer.write(frame)
 
 # ===============================================================
-# Cleanup
+# Cleanup + browser-friendly MP4
 # ===============================================================
 vid.release()
 video_writer.release()
 cv.destroyAllWindows()
 print("✅ Done — saved annotated video to result.mp4")
+
+if STANDARDIZE_MP4:
+    src = "/content/flow-counter/result.mp4"
+    dst = "/content/flow-counter/result_fixed.mp4"
+    try:
+        # Re-encode with H.264 / yuv420p for broad compatibility (Colab, browsers)
+        cmd = ["ffmpeg", "-y", "-i", src, "-vcodec", "libx264", "-pix_fmt", "yuv420p", dst]
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        print(f"🎬 Re-encoded to {dst}")
+    except Exception as e:
+        print(f"ffmpeg re-encode skipped/failed: {e}")
