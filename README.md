@@ -176,13 +176,6 @@ apt install ffmpeg -y
 
 ---
 
-## 📸 Example Output (Placeholder)
-Add your result screenshot here:
-```bash
-![Example Output](assets/example_frame.jpg)
-```
-
----
 
 **Developed by Toorese Lasebikan, 2025**
 
